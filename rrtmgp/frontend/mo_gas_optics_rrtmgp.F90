@@ -586,6 +586,8 @@ contains
         !$acc        enter data create(   col_dry_arr)
         !$omp target enter data map(alloc:col_dry_arr)
         col_dry_arr = get_col_dry(ncol, nlay, vmr(:,:,idx_h2o), plev) * 1.e-4_wp
+        !$acc        update device(col_dry_arr)
+        !$omp target update to(col_dry_arr)
         ! dry air column amounts computation, convert to #/cm^2
         col_dry_wk => col_dry_arr
       end if
