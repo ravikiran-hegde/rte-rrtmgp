@@ -130,6 +130,50 @@ foreach(scheme IN ITEMS rrtmgp ssm ddq)
     endforeach()
   endforeach()
 
+  if(scheme STREQUAL "ddq")
+    # The same DDQ cases with gas optics and solver in one kernel, written to their own directory
+    # and checked against the same reference
+    file(MAKE_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/fused)
+    foreach(band IN ITEMS lw sw)
+      if(band STREQUAL "lw")
+        set(scheme_data ${data_dir}/gas_optics_lw.nc)
+      else()
+        set(scheme_data ${data_dir}/gas_optics_sw.nc)
+      endif()
+      foreach(state IN ITEMS rfmip ckdmip rce)
+        add_test(
+          NAME run_rte_examples_ddq-fused_${band}_${state}
+          COMMAND
+            rte_examples 8 ddq-fused ${scheme_data}
+            ${RTE_EXAMPLES_DATA}/${state}-states.nc
+            ${CMAKE_CURRENT_BINARY_DIR}/fused/ddq-${band}-${state}.nc
+        )
+        set_tests_properties(
+          run_rte_examples_ddq-fused_${band}_${state}
+          PROPERTIES FIXTURES_REQUIRED "fetch_ddq_data;fetch_rte_examples_data"
+                     FIXTURES_SETUP "run_rte_examples_ddq-fused_${band}_${state}"
+        )
+      endforeach()
+    endforeach()
+    foreach(state IN ITEMS rfmip ckdmip rce)
+      add_test(
+        NAME check_rte_examples_ddq-fused_${state}
+        COMMAND
+          ${Python3_EXECUTABLE}
+          ${CMAKE_SOURCE_DIR}/examples/compare-to-reference.py --ref_dir
+          ${data_dir}/examples/rte-examples/reference --tst_dir
+          ${CMAKE_CURRENT_BINARY_DIR}/fused --file_names ddq-lw-${state}.nc
+          ddq-sw-${state}.nc --failure_threshold ${FAILURE_THRESHOLD}
+      )
+      set_tests_properties(
+        check_rte_examples_ddq-fused_${state}
+        PROPERTIES
+          FIXTURES_REQUIRED
+          "fetch_ddq_data;run_rte_examples_ddq-fused_lw_${state};run_rte_examples_ddq-fused_sw_${state}"
+      )
+    endforeach()
+  endif()
+
   foreach(state IN ITEMS rfmip ckdmip rce)
     # RRTMGP longwave fluxes on the 127-layer rce states lose ~1 W m-2 to
     # rounding in single precision. See rte-rrtmgp issue #420.

@@ -37,6 +37,9 @@ module mo_gas_optics_ddq
   use mo_gas_optics_ddq_kernels, &
                              only: tau_absorption_from_fits, add_tau_rayleigh, &
                                    fax_norder, fax_nterms, xsec_nterms
+  use mo_gas_optics_ddq_fused_kernels, &
+                             only: get_layer_number_ddq => get_layer_number, tau_absorption_from_fits_invariants, &
+                                   lw_solver_noscat_ddq, sw_solver_2stream_ddq
   implicit none
   private
 
@@ -112,7 +115,20 @@ module mo_gas_optics_ddq
     procedure, public  :: gas_optics_int
     procedure, public  :: gas_optics_ext
 
+    ! Gas optics and the RTE solvers in one kernel
+    procedure, public  :: rte_lw => rte_lw_ddq
+    procedure, public  :: rte_sw => rte_sw_ddq
   end type
+  !
+  ! The nu-independent quantities of tau_absorption_from_fits, for rte_lw_ddq and rte_sw_ddq
+  !
+  type :: ty_nu_independent
+    integer :: fax_ngas = 0, xsec_ngas = 0, mtckd_ngas = 0
+    integer,  dimension(:),     allocatable :: fax_num_index, xsec_num_index, mtckd_num_index
+    real(wp), dimension(:,:),   allocatable :: dry_num, fax_rs, inv_2kT
+    real(wp), dimension(:,:,:), allocatable :: fax_x, fax_w, xsec_w, mt_logr, mt_sw, mt_fw
+    real(wp), dimension(:,:,:), allocatable :: no_lut            ! stands in for cloud tables without clouds
+  end type ty_nu_independent
 contains
   !--------------------------------------------------------------------------------------------------------------------
   !
@@ -320,10 +336,8 @@ contains
     integer,  dimension(size(this%fax_species_names))   ::   fax_num_index
     integer,  dimension(size(this%xsec_species_names))  ::  xsec_num_index
     integer,  dimension(size(this%mtckd_species_names)) :: mtckd_num_index
-    character(len=32), &
-              dimension(:), allocatable     :: temp_gas_names
-    character(len=gas_name_len), &             ! Gases provided by users; union of these with known gases
-              dimension(:), allocatable     :: provided_gases, gases_to_use
+    character(len=gas_name_len), &
+              dimension(:), allocatable     :: gases_to_use
     integer :: ncol, nlay, ngas, nnu
     integer :: icol, ilay, igas, idx_h2o
     ! -----------------------------------------------------------
@@ -375,23 +389,7 @@ contains
     if(error_msg /= '') return
     ! -----------------------------------------------------------
 
-    allocate(temp_gas_names(gas_desc%get_num_gases()), &
-             provided_gases(gas_desc%get_num_gases()))
-    ! temp_gas_names is of uniform string length
-    temp_gas_names(:) = gas_desc%get_gas_names()
-    ! Which gases does the user provide?
-    do igas = 1, size(temp_gas_names)
-      provided_gases(igas) = trim(temp_gas_names(igas))
-    end do
-
-    ! Which gases does the user provide that the scheme knows about?
-    allocate(gases_to_use(count([(string_in_array(provided_gases(igas), &
-                                                 this%species_names),  &
-                                 igas = 1, size(provided_gases))])))
-    gases_to_use = pack(provided_gases, &
-                        mask = [(string_in_array(provided_gases(igas), &
-                                                 this%species_names),  &
-                                 igas = 1, size(provided_gases))])
+    call match_gases(this, gas_desc, gases_to_use, fax_num_index, xsec_num_index, mtckd_num_index)
 
     ! vmr array, gas index 0 stands in for gases users haven't supplied (vmr = 0);
     ! column dimension first for unit-stride access in the kernel
@@ -405,22 +403,6 @@ contains
     end do
 
     if (error_msg == "") then
-      fax_num_index = [(max(string_loc_in_array(this%fax_species_names(igas), &
-                                                gases_to_use),                &
-                            0), &
-                       igas = 1, size(this%fax_species_names) &
-                      )]
-      xsec_num_index = [(max(string_loc_in_array(this%xsec_species_names(igas), &
-                                                 gases_to_use),                &
-                            0), &
-                         igas = 1, size(this%xsec_species_names) &
-                       )]
-      mtckd_num_index = [(max(string_loc_in_array(this%mtckd_species_names(igas), &
-                                                  gases_to_use),                &
-                              0), &
-                          igas = 1, size(this%mtckd_species_names) &
-                        )]
-
       if (present(col_dry)) then
         dry_num => col_dry
       else
@@ -455,6 +437,412 @@ contains
     !$acc end data
     !$omp end target data
   end function compute_tau_absorption
+  !--------------------------------------------------------------------------------------------------------------------
+  !
+  ! Gases provided by the user that the scheme knows, and where each set of fits finds them (0 if missing)
+  !
+  subroutine match_gases(this, gas_desc, gases_to_use, fax_num_index, xsec_num_index, mtckd_num_index)
+    class(ty_gas_optics_ddq),    intent(in ) :: this
+    type(ty_gas_concs),          intent(in ) :: gas_desc
+    character(len=gas_name_len), dimension(:), allocatable, &
+                                 intent(out) :: gases_to_use
+    integer, dimension(:),       intent(out) :: fax_num_index, xsec_num_index, mtckd_num_index
+    ! -----------------------
+    character(len=32),           dimension(:), allocatable :: temp_gas_names
+    character(len=gas_name_len), dimension(:), allocatable :: provided_gases
+    integer :: igas
+
+    allocate(temp_gas_names(gas_desc%get_num_gases()), &
+             provided_gases(gas_desc%get_num_gases()))
+    ! temp_gas_names is of uniform string length
+    temp_gas_names(:) = gas_desc%get_gas_names()
+    do igas = 1, size(temp_gas_names)
+      provided_gases(igas) = trim(temp_gas_names(igas))
+    end do
+    allocate(gases_to_use(count([(string_in_array(provided_gases(igas), this%species_names), &
+                                  igas = 1, size(provided_gases))])))
+    gases_to_use = pack(provided_gases, &
+                        mask = [(string_in_array(provided_gases(igas), this%species_names), &
+                                 igas = 1, size(provided_gases))])
+    fax_num_index   = [(max(string_loc_in_array(this%fax_species_names(igas), gases_to_use), 0), &
+                        igas = 1, size(this%fax_species_names))]
+    xsec_num_index  = [(max(string_loc_in_array(this%xsec_species_names(igas), gases_to_use), 0), &
+                        igas = 1, size(this%xsec_species_names))]
+    mtckd_num_index = [(max(string_loc_in_array(this%mtckd_species_names(igas), gases_to_use), 0), &
+                        igas = 1, size(this%mtckd_species_names))]
+  end subroutine match_gases
+  !--------------------------------------------------------------------------------------------------------------------
+  !
+  ! Gas optics and rte_lw in one kernel: broadband longwave fluxes without scattering and with one
+  !   quadrature angle, as gas_optics followed by rte_lw, without fields of spectral dimension.
+  !   With clouds (condensate paths, effective radii and the lookup tables of the cloud optics,
+  !   (nsteps, nnu, 3) for extinction, single-scattering albedo and asymmetry), flux_up and flux_dn
+  !   are all-sky fluxes and the optional *_clrsky arguments clear-sky ones.
+  !
+  function rte_lw_ddq(this, play, plev, tlay, tsfc, gas_desc, sfc_emis, flux_up, flux_dn, tlev, &
+                      flux_up_clrsky, flux_dn_clrsky,                                           &
+                      clwp, ciwp, reliq, reice, lut_liq, radliq_lwr, liq_step_size,             &
+                      lut_ice, radice_lwr, ice_step_size) result(error_msg)
+    class(ty_gas_optics_ddq), intent(in ) :: this
+    real(wp), dimension(:,:), intent(in ) :: play, &     !! layer pressures [Pa, mb]; (ncol,nlay)
+                                             plev, &     !! level pressures [Pa, mb]; (ncol,nlay+1)
+                                             tlay        !! layer temperatures [K]; (ncol,nlay)
+    real(wp), dimension(:),   intent(in ) :: tsfc        !! surface skin temperatures [K]; (ncol)
+    type(ty_gas_concs),       intent(in ) :: gas_desc    !! Gas volume mixing ratios
+    real(wp), dimension(:,:), intent(in ) :: sfc_emis    !! emissivity at surface []; (nnu, ncol)
+    real(wp), dimension(:,:), target, intent(inout) :: flux_up, flux_dn  !! broadband fluxes [W/m2]; (ncol,nlay+1)
+    real(wp), dimension(:,:), intent(in ) :: tlev        !! level temperatures [K]; (ncol,nlay+1)
+    real(wp), dimension(:,:), target, optional, intent(inout) :: flux_up_clrsky, flux_dn_clrsky
+    real(wp), dimension(:,:),   optional, intent(in ) :: clwp, ciwp, reliq, reice !! [g/m2], [microns]; (ncol,nlay)
+    real(wp), dimension(:,:,:), optional, intent(in ) :: lut_liq, lut_ice
+    real(wp),                   optional, intent(in ) :: radliq_lwr, liq_step_size, radice_lwr, ice_step_size
+    character(len=128)                    :: error_msg
+    ! -----------------------
+    ! Secant and weight of the one-angle Gaussian quadrature in rte_lw
+    real(wp), parameter :: lw_Ds = 1._wp/0.6096748751_wp, lw_wts = 1._wp
+    type(ty_nu_independent) :: st
+    real(wp), dimension(:,:,:), allocatable :: trans, source_up
+    real(wp), dimension(:,:),   pointer     :: flux_up_clr, flux_dn_clr
+    integer     :: ncol, nlay, nnu
+    logical(wl) :: top_at_1, do_clrsky, do_allsky
+    ! -----------------------
+    ncol = size(play, 1)
+    nlay = size(play, 2)
+    nnu  = this%get_ngpt()
+    error_msg = check_fused_inputs(this, ncol, nlay, plev, tlay, flux_up, flux_dn, &
+                                   clwp, ciwp, reliq, reice, lut_liq, lut_ice,     &
+                                   radliq_lwr, liq_step_size, radice_lwr, ice_step_size)
+    if (check_extents .and. error_msg == '') then
+      if(.not. extents_are(tlev, ncol, nlay+1)) error_msg = "rte_lw_ddq(): array tlev has wrong size"
+      if(.not. extents_are(sfc_emis, nnu, ncol)) error_msg = "rte_lw_ddq(): array sfc_emis has wrong size"
+    end if
+    if (error_msg /= '') return
+
+    do_allsky = present(clwp)
+    do_clrsky = .not. do_allsky .or. present(flux_up_clrsky)
+    if (do_allsky .and. do_clrsky) then
+      flux_up_clr => flux_up_clrsky
+      flux_dn_clr => flux_dn_clrsky
+    else
+      flux_up_clr => flux_up
+      flux_dn_clr => flux_dn
+    end if
+    top_at_1 = play(1, 1) < play(1, nlay)
+    allocate(trans(ncol, nlay, 2), source_up(ncol, nlay, 2))
+    !$acc        data copyin(play, plev, tlay, tlev, tsfc, sfc_emis) copy(flux_up, flux_dn) create(trans, source_up)
+    !$omp target data map(to:play, plev, tlay, tlev, tsfc, sfc_emis) map(tofrom:flux_up, flux_dn) map(alloc:trans, source_up)
+    !$acc        data copy(flux_up_clr, flux_dn_clr) if(do_allsky .and. do_clrsky)
+    !$omp target data map(tofrom:flux_up_clr, flux_dn_clr) if(do_allsky .and. do_clrsky)
+    error_msg = tau_absorption_invariants(this, play, plev, tlay, gas_desc, st)
+    if (error_msg == "") then
+      if (do_allsky) then
+        !$acc        data copyin(clwp, ciwp, reliq, reice)
+        !$omp target data map(to:clwp, ciwp, reliq, reice)
+        call lw_solver_noscat_ddq(ncol, nlay, nnu, logical(top_at_1, wl), lw_Ds, lw_wts, this%nus, this%weights, &
+                                  play, tlay, tlev, tsfc, sfc_emis,                                         &
+                                  st%fax_ngas, this%fax_a, this%fax_b, this%fax_T0, this%fax_c, this%fax_sigma0, &
+                                  st%xsec_ngas, this%xsec_p, st%mtckd_ngas, this%mtckd_cself, this%mtckd_cfrgn, &
+                                  this%mtckd_n, st%fax_x, st%fax_w, st%fax_rs, st%xsec_w,                    &
+                                  st%mt_logr, st%mt_sw, st%mt_fw, st%inv_2kT,                                &
+                                  do_clrsky, do_allsky, clwp, ciwp, reliq, reice,                            &
+                                  size(lut_liq, 1), liq_step_size, radliq_lwr, lut_liq,                      &
+                                  size(lut_ice, 1), ice_step_size, radice_lwr, lut_ice,                      &
+                                  trans, source_up, flux_up_clr, flux_dn_clr, flux_up, flux_dn)
+        !$acc end data
+        !$omp end target data
+      else
+        ! Without clouds the cloud arguments are not referenced
+        call lw_solver_noscat_ddq(ncol, nlay, nnu, logical(top_at_1, wl), lw_Ds, lw_wts, this%nus, this%weights, &
+                                  play, tlay, tlev, tsfc, sfc_emis,                                         &
+                                  st%fax_ngas, this%fax_a, this%fax_b, this%fax_T0, this%fax_c, this%fax_sigma0, &
+                                  st%xsec_ngas, this%xsec_p, st%mtckd_ngas, this%mtckd_cself, this%mtckd_cfrgn, &
+                                  this%mtckd_n, st%fax_x, st%fax_w, st%fax_rs, st%xsec_w,                    &
+                                  st%mt_logr, st%mt_sw, st%mt_fw, st%inv_2kT,                                &
+                                  do_clrsky, do_allsky, play, play, play, play,                              &
+                                  2, 1._wp, 0._wp, st%no_lut, 2, 1._wp, 0._wp, st%no_lut,                    &
+                                  trans, source_up, flux_up_clr, flux_dn_clr, flux_up, flux_dn)
+      end if
+    end if
+    call finalize_invariants(st)
+    !$acc end data
+    !$omp end target data
+    !$acc end data
+    !$omp end target data
+  end function rte_lw_ddq
+  !--------------------------------------------------------------------------------------------------------------------
+  !
+  ! Gas optics and rte_sw in one kernel: broadband shortwave fluxes with two-stream scattering, as
+  !   gas_optics followed by rte_sw; flux_dn is total. The solar source of the data is scaled to tsi
+  !   if given, and per column by toa_factor (for example 0 at night). Clouds as for rte_lw_ddq.
+  !   Optionally, surface fluxes weighted per spectral point by sfc_frac(nnu, nfrac), for the
+  !   all-sky fluxes, or the clear-sky ones without clouds.
+  !
+  function rte_sw_ddq(this, play, plev, tlay, gas_desc, mu0, sfc_alb_dir, sfc_alb_dif, flux_up, flux_dn, &
+                      flux_up_clrsky, flux_dn_clrsky, tsi, toa_factor,                                    &
+                      clwp, ciwp, reliq, reice, lut_liq, radliq_lwr, liq_step_size,                       &
+                      lut_ice, radice_lwr, ice_step_size,                                                 &
+                      sfc_frac, sfc_dn_dir, sfc_dn_dif, sfc_up, flux_dn_dir) result(error_msg)
+    class(ty_gas_optics_ddq), intent(in ) :: this
+    real(wp), dimension(:,:), intent(in ) :: play, &     !! layer pressures [Pa, mb]; (ncol,nlay)
+                                             plev, &     !! level pressures [Pa, mb]; (ncol,nlay+1)
+                                             tlay        !! layer temperatures [K]; (ncol,nlay)
+    type(ty_gas_concs),       intent(in ) :: gas_desc    !! Gas volume mixing ratios
+    real(wp), dimension(:),   intent(in ) :: mu0         !! cosine of solar zenith angle, > 0; (ncol)
+    real(wp), dimension(:,:), intent(in ) :: sfc_alb_dir, sfc_alb_dif !! surface albedo; (nnu,ncol)
+    real(wp), dimension(:,:), target, intent(inout) :: flux_up, flux_dn  !! broadband fluxes [W/m2]; (ncol,nlay+1)
+    real(wp), dimension(:,:), target, optional, intent(inout) :: flux_up_clrsky, flux_dn_clrsky
+    real(wp),                   optional, intent(in ) :: tsi
+    real(wp), dimension(:),     optional, intent(in ) :: toa_factor !! (ncol)
+    real(wp), dimension(:,:),   optional, intent(in ) :: clwp, ciwp, reliq, reice
+    real(wp), dimension(:,:,:), optional, intent(in ) :: lut_liq, lut_ice
+    real(wp),                   optional, intent(in ) :: radliq_lwr, liq_step_size, radice_lwr, ice_step_size
+    real(wp), dimension(:,:),   optional, intent(in ) :: sfc_frac   !! (nnu,nfrac)
+    real(wp), dimension(:,:),   optional, intent(inout) :: sfc_dn_dir, sfc_dn_dif, sfc_up !! (ncol,nfrac)
+    real(wp), dimension(:,:), target, optional, intent(inout) :: flux_dn_dir !! direct beam [W/m2]; (ncol,nlay+1)
+    character(len=128)                    :: error_msg
+    ! -----------------------
+    type(ty_nu_independent) :: st
+    real(wp), dimension(:,:), pointer     :: flux_dir
+    real(wp), dimension(:,:), allocatable :: tau, ssa, Rdif, Tdif, source_dn, source_up, albedo, src
+    real(wp), dimension(:,:), pointer     :: flux_up_clr, flux_dn_clr
+    real(wp), dimension(size(this%nus))    :: solar_source
+    real(wp), dimension(size(play, 1))     :: factor
+    real(wp), dimension(size(this%nus), 1) :: no_frac
+    real(wp), dimension(:), allocatable    :: rayleigh_xsec
+    integer     :: ncol, nlay, nnu, nfrac, icol
+    logical(wl) :: top_at_1, do_clrsky, do_allsky, has_rayleigh
+    ! -----------------------
+    ncol = size(play, 1)
+    nlay = size(play, 2)
+    nnu  = this%get_ngpt()
+    error_msg = check_fused_inputs(this, ncol, nlay, plev, tlay, flux_up, flux_dn, &
+                                   clwp, ciwp, reliq, reice, lut_liq, lut_ice,     &
+                                   radliq_lwr, liq_step_size, radice_lwr, ice_step_size)
+    if (error_msg == '' .and. .not. allocated(this%solar_source)) error_msg = "rte_sw_ddq(): no solar source"
+    if (check_extents .and. error_msg == '') then
+      if(.not. extents_are(mu0, ncol)) error_msg = "rte_sw_ddq(): array mu0 has wrong size"
+      if(.not. extents_are(sfc_alb_dir, nnu, ncol) .or. .not. extents_are(sfc_alb_dif, nnu, ncol)) &
+        error_msg = "rte_sw_ddq(): surface albedo arrays have wrong size"
+    end if
+    if (error_msg /= '') return
+
+    do_allsky = present(clwp)
+    do_clrsky = .not. do_allsky .or. present(flux_up_clrsky)
+    if (do_allsky .and. do_clrsky) then
+      flux_up_clr => flux_up_clrsky
+      flux_dn_clr => flux_dn_clrsky
+    else
+      flux_up_clr => flux_up
+      flux_dn_clr => flux_dn
+    end if
+    if (present(flux_dn_dir)) then
+      flux_dir => flux_dn_dir
+    else
+      flux_dir => flux_up
+    end if
+    solar_source(:) = this%solar_source(:)
+    if (present(tsi)) solar_source(:) = solar_source(:) * tsi / sum(this%solar_source(:) * this%weights(:))
+    has_rayleigh = allocated(this%rayleigh_xsec)
+    if (has_rayleigh) then
+      rayleigh_xsec = this%rayleigh_xsec
+    else
+      allocate(rayleigh_xsec(nnu))
+      rayleigh_xsec(:) = 0._wp
+    end if
+    nfrac = 0
+    if (present(sfc_frac)) nfrac = size(sfc_frac, 2)
+    no_frac(:,:) = 0._wp
+    top_at_1 = play(1, 1) < play(1, nlay)
+    allocate(tau(ncol, nlay), ssa(ncol, nlay), Rdif(ncol, nlay), Tdif(ncol, nlay), &
+             source_dn(ncol, nlay), source_up(ncol, nlay), albedo(ncol, nlay+1), src(ncol, nlay+1))
+    !$acc        data copyin(play, plev, tlay, mu0, sfc_alb_dir, sfc_alb_dif) copy(flux_up, flux_dn) &
+    !$acc             create(factor, tau, ssa, Rdif, Tdif, source_dn, source_up, albedo, src)
+    !$omp target data map(to:play, plev, tlay, mu0, sfc_alb_dir, sfc_alb_dif) map(tofrom:flux_up, flux_dn) &
+    !$omp             map(alloc:factor, tau, ssa, Rdif, Tdif, source_dn, source_up, albedo, src)
+    !$acc        data copy(flux_up_clr, flux_dn_clr) if(do_allsky .and. do_clrsky)
+    !$omp target data map(tofrom:flux_up_clr, flux_dn_clr) if(do_allsky .and. do_clrsky)
+    !$acc        data copy(flux_dir) if(present(flux_dn_dir))
+    !$omp target data map(tofrom:flux_dir) if(present(flux_dn_dir))
+    ! toa_factor may exist on the device only
+    if (present(toa_factor)) then
+      !$acc                         parallel loop    gang vector copyin(toa_factor) default(present)
+      !$omp target teams distribute parallel do simd map(to:toa_factor)
+      do icol = 1, ncol
+        factor(icol) = toa_factor(icol)
+      end do
+    else
+      !$acc                         parallel loop    gang vector default(present)
+      !$omp target teams distribute parallel do simd
+      do icol = 1, ncol
+        factor(icol) = 1._wp
+      end do
+    end if
+    error_msg = tau_absorption_invariants(this, play, plev, tlay, gas_desc, st)
+    if (error_msg == "") then
+      if (do_allsky .and. nfrac > 0) then
+        !$acc        data copyin(clwp, ciwp, reliq, reice) copy(sfc_dn_dir, sfc_dn_dif, sfc_up)
+        !$omp target data map(to:clwp, ciwp, reliq, reice) map(tofrom:sfc_dn_dir, sfc_dn_dif, sfc_up)
+        call sw_solver(clwp, ciwp, reliq, reice, size(lut_liq, 1), liq_step_size, radliq_lwr, lut_liq, &
+                       size(lut_ice, 1), ice_step_size, radice_lwr, lut_ice, nfrac, sfc_frac, sfc_dn_dir, sfc_dn_dif, sfc_up)
+        !$acc end data
+        !$omp end target data
+      else if (do_allsky) then
+        !$acc        data copyin(clwp, ciwp, reliq, reice)
+        !$omp target data map(to:clwp, ciwp, reliq, reice)
+        call sw_solver(clwp, ciwp, reliq, reice, size(lut_liq, 1), liq_step_size, radliq_lwr, lut_liq, &
+                       size(lut_ice, 1), ice_step_size, radice_lwr, lut_ice, 0, no_frac, flux_up, flux_up, flux_up)
+        !$acc end data
+        !$omp end target data
+      else if (nfrac > 0) then
+        !$acc        data copy(sfc_dn_dir, sfc_dn_dif, sfc_up)
+        !$omp target data map(tofrom:sfc_dn_dir, sfc_dn_dif, sfc_up)
+        call sw_solver(play, play, play, play, 2, 1._wp, 0._wp, st%no_lut, 2, 1._wp, 0._wp, st%no_lut, &
+                       nfrac, sfc_frac, sfc_dn_dir, sfc_dn_dif, sfc_up)
+        !$acc end data
+        !$omp end target data
+      else
+        call sw_solver(play, play, play, play, 2, 1._wp, 0._wp, st%no_lut, 2, 1._wp, 0._wp, st%no_lut, &
+                       0, no_frac, flux_up, flux_up, flux_up)
+      end if
+    end if
+    call finalize_invariants(st)
+    !$acc end data
+    !$omp end target data
+    !$acc end data
+    !$omp end target data
+    !$acc end data
+    !$omp end target data
+  contains
+    ! The kernel with the arguments that are the same in all cases above
+    subroutine sw_solver(c_lwp, c_iwp, c_rel, c_rei, n_liq, step_liq, lwr_liq, t_liq, &
+                         n_ice, step_ice, lwr_ice, t_ice, n_frac, frac, f_dir, f_dif, f_up)
+      real(wp), dimension(:,:),   intent(in)    :: c_lwp, c_iwp, c_rel, c_rei, frac
+      integer,                    intent(in)    :: n_liq, n_ice, n_frac
+      real(wp),                   intent(in)    :: step_liq, lwr_liq, step_ice, lwr_ice
+      real(wp), dimension(:,:,:), intent(in)    :: t_liq, t_ice
+      real(wp), dimension(:,:),   intent(inout) :: f_dir, f_dif, f_up
+      call sw_solver_2stream_ddq(ncol, nlay, nnu, logical(top_at_1, wl), this%nus, this%weights, solar_source, &
+                                 mu0, factor, sfc_alb_dir, sfc_alb_dif, play, tlay, st%dry_num,               &
+                                 st%fax_ngas, this%fax_a, this%fax_b, this%fax_T0, this%fax_c, this%fax_sigma0, &
+                                 st%xsec_ngas, this%xsec_p, st%mtckd_ngas, this%mtckd_cself, this%mtckd_cfrgn, &
+                                 this%mtckd_n, st%fax_x, st%fax_w, st%fax_rs, st%xsec_w,                       &
+                                 st%mt_logr, st%mt_sw, st%mt_fw, st%inv_2kT, has_rayleigh, rayleigh_xsec,      &
+                                 do_clrsky, do_allsky, c_lwp, c_iwp, c_rel, c_rei,                             &
+                                 n_liq, step_liq, lwr_liq, t_liq, n_ice, step_ice, lwr_ice, t_ice,             &
+                                 n_frac, frac, f_dir, f_dif, f_up,                                             &
+                                 tau, ssa, Rdif, Tdif, source_dn, source_up, albedo, src,                      &
+                                 flux_up_clr, flux_dn_clr, flux_up, flux_dn,                                   &
+                                 logical(present(flux_dn_dir), wl), flux_dir)
+    end subroutine sw_solver
+  end function rte_sw_ddq
+  !--------------------------------------------------------------------------------------------------------------------
+  function check_fused_inputs(this, ncol, nlay, plev, tlay, flux_up, flux_dn, &
+                              clwp, ciwp, reliq, reice, lut_liq, lut_ice,     &
+                              radliq_lwr, liq_step_size, radice_lwr, ice_step_size) result(error_msg)
+    class(ty_gas_optics_ddq),   intent(in) :: this
+    integer,                    intent(in) :: ncol, nlay
+    real(wp), dimension(:,:),   intent(in) :: plev, tlay, flux_up, flux_dn
+    real(wp), dimension(:,:),   optional, intent(in) :: clwp, ciwp, reliq, reice
+    real(wp), dimension(:,:,:), optional, intent(in) :: lut_liq, lut_ice
+    real(wp),                   optional, intent(in) :: radliq_lwr, liq_step_size, radice_lwr, ice_step_size
+    character(len=128)                     :: error_msg
+
+    error_msg = ""
+    if (.not. this%is_loaded()) then
+      error_msg = 'Spectral configuration not loaded'
+      return
+    end if
+    if (present(clwp) .neqv. (present(ciwp) .and. present(reliq) .and. present(reice) .and.          &
+                              present(lut_liq) .and. present(radliq_lwr) .and. present(liq_step_size) .and. &
+                              present(lut_ice) .and. present(radice_lwr) .and. present(ice_step_size))) then
+      error_msg = "fused fluxes: provide all cloud arguments or none"
+      return
+    end if
+    if (check_extents) then
+      if(.not. extents_are(plev, ncol, nlay+1) .or. .not. extents_are(tlay, ncol, nlay)) &
+        error_msg = "fused fluxes: atmospheric arrays have wrong size"
+      if(.not. extents_are(flux_up, ncol, nlay+1) .or. .not. extents_are(flux_dn, ncol, nlay+1)) &
+        error_msg = "fused fluxes: flux arrays have wrong size"
+      if (present(clwp)) then
+        if(.not. extents_are(clwp, ncol, nlay) .or. .not. extents_are(ciwp, ncol, nlay) .or. &
+           .not. extents_are(reliq, ncol, nlay) .or. .not. extents_are(reice, ncol, nlay))   &
+          error_msg = "fused fluxes: cloud arrays have wrong size"
+        if(size(lut_liq, 2) /= this%get_ngpt() .or. size(lut_ice, 2) /= this%get_ngpt() .or. &
+           size(lut_liq, 3) /= 3 .or. size(lut_ice, 3) /= 3) &
+          error_msg = "fused fluxes: cloud tables have wrong size"
+      end if
+    end if
+  end function check_fused_inputs
+  !--------------------------------------------------------------------------------------------------------------------
+  !
+  ! The nu-independent quantities of tau_absorption_from_fits on the device, one gas at a time;
+  !   play, plev and tlay must be present on the device
+  !
+  function tau_absorption_invariants(this, play, plev, tlay, gas_desc, st) result(error_msg)
+    class(ty_gas_optics_ddq), intent(in   ) :: this
+    real(wp), dimension(:,:), intent(in   ) :: play, plev, tlay
+    type(ty_gas_concs),       intent(in   ) :: gas_desc
+    type(ty_nu_independent),  intent(inout) :: st
+    character(len=128)                      :: error_msg
+    character(len=gas_name_len), dimension(:), allocatable :: gases_to_use
+    real(wp), dimension(size(play, 1), size(play, 2)) :: vmr
+    integer :: ncol, nlay, nnu, igas, idx_h2o
+
+    error_msg = ""
+    ncol = size(play, 1)
+    nlay = size(play, 2)
+    nnu  = this%get_ngpt()
+    allocate(st%fax_num_index(size(this%fax_species_names)), st%xsec_num_index(size(this%xsec_species_names)), &
+             st%mtckd_num_index(size(this%mtckd_species_names)))
+    call match_gases(this, gas_desc, gases_to_use, st%fax_num_index, st%xsec_num_index, st%mtckd_num_index)
+    st%fax_ngas   = size(st%fax_num_index)
+    st%xsec_ngas  = size(st%xsec_num_index)
+    st%mtckd_ngas = size(st%mtckd_num_index)
+    idx_h2o = max(string_loc_in_array("h2o", gases_to_use), 0)
+    allocate(st%dry_num(ncol, nlay), st%fax_x(ncol, nlay, st%fax_ngas), st%fax_w(ncol, nlay, st%fax_ngas),  &
+             st%fax_rs(st%fax_ngas, nnu), st%xsec_w(ncol, nlay, st%xsec_ngas),                               &
+             st%mt_logr(ncol, nlay, st%mtckd_ngas), st%mt_sw(ncol, nlay, st%mtckd_ngas),                     &
+             st%mt_fw(ncol, nlay, st%mtckd_ngas), st%inv_2kT(ncol, nlay), st%no_lut(2, nnu, 3))
+    st%no_lut(:,:,:) = 0._wp
+    !$acc enter data copyin(st)
+    !$omp target enter data map(to:st)
+    !$acc enter data create(st%dry_num, st%fax_x, st%fax_w, st%fax_rs, st%xsec_w) &
+    !$acc            create(st%mt_logr, st%mt_sw, st%mt_fw, st%inv_2kT) copyin(st%no_lut)
+    !$omp target enter data map(alloc:st%dry_num, st%fax_x, st%fax_w, st%fax_rs, st%xsec_w) &
+    !$omp            map(alloc:st%mt_logr, st%mt_sw, st%mt_fw, st%inv_2kT) map(to:st%no_lut)
+    !$acc        data create(vmr)
+    !$omp target data map(alloc:vmr)
+    ! Dry air needs water vapor first; gases users haven't supplied (index 0) have vmr = 0
+    call zero_array(ncol, nlay, vmr)
+    if (idx_h2o > 0) error_msg = gas_desc%get_vmr(gases_to_use(idx_h2o), vmr)
+    if (error_msg == "") call get_layer_number_ddq(ncol, nlay, vmr, plev, st%dry_num)
+    if (error_msg == "") call zero_array(ncol, nlay, vmr)
+    do igas = 0, size(gases_to_use)
+      if (error_msg /= "") exit
+      if (igas > 0) error_msg = gas_desc%get_vmr(gases_to_use(igas), vmr)
+      if (error_msg == "") &
+        call tau_absorption_from_fits_invariants(ncol, nlay, nnu, igas, play, tlay, st%dry_num, vmr, &
+                  st%fax_ngas, st%fax_num_index, this%fax_c, this%fax_p0, this%fax_S, this%fax_vmr0,  &
+                  st%xsec_ngas, st%xsec_num_index,                                                    &
+                  st%mtckd_ngas, st%mtckd_num_index, this%mtckd_T0, this%mtckd_p0,                    &
+                  st%fax_x, st%fax_w, st%fax_rs, st%xsec_w, st%mt_logr, st%mt_sw, st%mt_fw, st%inv_2kT)
+    end do
+    !$acc end data
+    !$omp end target data
+  end function tau_absorption_invariants
+  !--------------------------------------------------------------------------------------------------------------------
+  subroutine finalize_invariants(st)
+    type(ty_nu_independent), intent(inout) :: st
+    if (.not. allocated(st%dry_num)) return
+    !$acc exit data delete(st%dry_num, st%fax_x, st%fax_w, st%fax_rs, st%xsec_w) &
+    !$acc           delete(st%mt_logr, st%mt_sw, st%mt_fw, st%inv_2kT, st%no_lut)
+    !$omp target exit data map(release:st%dry_num, st%fax_x, st%fax_w, st%fax_rs, st%xsec_w) &
+    !$omp           map(release:st%mt_logr, st%mt_sw, st%mt_fw, st%inv_2kT, st%no_lut)
+    !$acc exit data delete(st)
+    !$omp target exit data map(release:st)
+    deallocate(st%dry_num, st%fax_x, st%fax_w, st%fax_rs, st%xsec_w, st%mt_logr, st%mt_sw, st%mt_fw, &
+               st%inv_2kT, st%no_lut)
+  end subroutine finalize_invariants
   !--------------------------------------------------------------------------------------------------------------------
   !
   ! Initialiation

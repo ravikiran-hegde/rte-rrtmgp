@@ -5,6 +5,8 @@
 ! Program to read fixed-format netCDF files and compute broadband fluxes
 !
 ! Program is invoked as rte_examples num_cols scheme_name input_file output_file
+!   scheme_name ddq-fused uses the DDQ data with gas optics and solver in one kernel
+!   (rte_lw and rte_sw of ty_gas_optics_ddq)
 ! -------------------------------------------------------------------------------------------------
 program rte_examples
   ! --------------------------------------------------
@@ -91,7 +93,8 @@ program rte_examples
 
   logical :: do_rrtmgp = .false., &
              do_ssm    = .false., &
-             do_ddq    = .false.
+             do_ddq    = .false., &
+             do_fused  = .false.
   logical :: do_lw
   ! --------------------------------------------------
   nUserArgs = command_argument_count()
@@ -107,7 +110,8 @@ program rte_examples
 
   do_rrtmgp = trim(scheme_name) == "rrtmgp"
   do_ssm    = trim(scheme_name) == "ssm"
-  do_ddq    = trim(scheme_name) == "ddq"
+  do_fused  = trim(scheme_name) == "ddq-fused"
+  do_ddq    = trim(scheme_name) == "ddq" .or. do_fused
   if(.not. any([do_rrtmgp, do_ssm, do_ddq])) &
     call stop_on_err("Unknown optics scheme")
 
@@ -177,7 +181,23 @@ program rte_examples
   !
   allocate(fluxes%flux_up(ncol, nlay+1), &
            fluxes%flux_dn(ncol, nlay+1))
-  if (gas_optics%source_is_internal()) then
+  if (do_fused) then
+    select type (gas_optics)
+      type is (ty_gas_optics_ddq)
+        if (gas_optics%source_is_internal()) then
+          call stop_on_err(gas_optics%rte_lw(pres_layer, pres_level, temp_layer, surface_temperature, &
+                                             gas_concs, sfc_props_spectral,                          &
+                                             fluxes%flux_up, fluxes%flux_dn, tlev = temp_level))
+        else
+          allocate(fluxes%flux_dn_dir(ncol, nlay+1))
+          call stop_on_err(gas_optics%rte_sw(pres_layer, pres_level, temp_layer, gas_concs,         &
+                                             cos(solar_zenith_angle * acos(-1._wp)/180._wp),      &
+                                             sfc_props_spectral, sfc_props_spectral,              &
+                                             fluxes%flux_up, fluxes%flux_dn,                      &
+                                             flux_dn_dir = fluxes%flux_dn_dir))
+        end if
+    end select
+  else if (gas_optics%source_is_internal()) then
     !
     ! Longwave calculations
     !

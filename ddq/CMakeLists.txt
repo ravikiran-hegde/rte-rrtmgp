@@ -1,6 +1,7 @@
 add_library(
   ddq # cmake-format: sort
   mo_gas_optics_ddq.F90
+  mo_gas_optics_ddq_fused_kernels.F90
 )
 
 if(RTE_KERNEL_MODE STREQUAL "accel")
@@ -14,6 +15,15 @@ else()
     ddq
     PRIVATE # cmake-format: sort
             mo_gas_optics_ddq_kernels.F90
+  )
+endif()
+
+# Each GPU thread of the fused kernels keeps many values; fewer registers per thread let more
+# columns run at once (about 20% faster on A100)
+if(CMAKE_Fortran_COMPILER_ID STREQUAL "NVHPC")
+  set_source_files_properties(
+    mo_gas_optics_ddq_fused_kernels.F90 PROPERTIES COMPILE_OPTIONS
+                                                   "-gpu=maxregcount:64"
   )
 endif()
 
